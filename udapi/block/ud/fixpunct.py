@@ -19,6 +19,8 @@ by joining a non-projectivity that already exists.
 For example, the left neighbor (node i-1) may have its parent at i-3,
 and the node i-2 forms a gap (does not depend on i-3).
 """
+import sys
+
 from udapi.core.block import Block
 # pylint: disable=no-self-use
 
@@ -42,16 +44,18 @@ PAIRED_PUNCT = {
     '¡': '!',   # Spanish exclamation quotation marks
     }
 
-FINAL_PUNCT = '.?!'
+FINAL_PUNCT = '.?!:;'
 
 
 class FixPunct(Block):
     """Make sure punctuation nodes are attached projectively."""
 
-    def __init__(self, **kwargs):
+    def __init__(self, check_paired_punct_upos=False, copy_to_enhanced=False, **kwargs):
         """Create the ud.FixPunct block instance."""
         super().__init__(**kwargs)
         self._punct_type = None
+        self.check_paired_punct_upos = check_paired_punct_upos
+        self.copy_to_enhanced = copy_to_enhanced
 
     def process_tree(self, root):
         # First, make sure no PUNCT has children
@@ -65,7 +69,7 @@ class FixPunct(Block):
         #   I call him "Bob."
         # Here both quotes and the sentence-final dot should be attached to "Bob".
         # (As you can see on the previous line, I don't like this American typographic rule.)
-        self._punct_type = [None] * (1 + len(root.descendants))
+        self._punct_type = [None for i in range(1 + len(root.descendants))]
         for node in root.descendants:
             if self._punct_type[node.ord] != 'closing':
                 closing_punct = PAIRED_PUNCT.get(node.form, None)
@@ -74,8 +78,50 @@ class FixPunct(Block):
 
         # Third, fix subordinate punctuation (i.e. any punctuation not marked in _punct_type).
         for node in root.descendants:
-            if node.upos == "PUNCT" and not self._punct_type[node.ord]:
+            if node.upos == "PUNCT" and self._punct_type[node.ord] is None:
                 self._fix_subord_punct(node)
+
+        # Fix parataxis, discourse and advmod enclosed in commas
+        for node in root.descendants:
+            if node.udeprel in {'parataxis', 'discourse', 'advmod'}:
+                # find left and right commas
+                left_comma, right_comma = node, node
+                while left_comma is not None and left_comma.upos != 'PUNCT':
+                    left_comma = left_comma.prev_node
+                while right_comma is not None and right_comma.upos != 'PUNCT':
+                    right_comma = right_comma.next_node
+
+                if left_comma is None or right_comma is None:
+                    continue
+
+                # check that the node is the highest here, otherwise ignore it
+                if any((left_comma.ord < cand.ord < right_comma.ord
+                        and cand.parent.ord == node.parent.ord) for cand in root.descendants):
+                    continue
+
+                cand = node
+                while (not cand.parent.is_root()
+                       and cand.parent.precedes(right_comma)
+                       and left_comma.precedes(cand.parent)
+                       and not right_comma.precedes(cand.descendants(add_self=1)[-1])
+                       and not cand.precedes(left_comma.descendants(add_self=1)[-1])):
+                   cand = cand.parent
+                if node != cand:
+                    continue
+
+                if (right_comma.lemma == left_comma.lemma == ',' or
+                   right_comma.lemma == left_comma.lemma == '-') and\
+                   (node.udeprel == 'parataxis' or\
+                   all(test == node or test.parent == node and test.udeprel == 'fixed'\
+                       for test in node.root.descendants[left_comma.ord:right_comma.ord-1])):
+                    if left_comma.parent.udeprel != 'parataxis' and\
+                       (left_comma.parent.udeprel != 'conj' or\
+                       left_comma.prev_node is not None and\
+                       left_comma.prev_node.upos == 'CCONJ'):
+                        left_comma.parent = node
+                        left_comma.deprel = 'punct'
+                    right_comma.parent = node
+                    right_comma.deprel = 'punct'
 
         # Finally, check if root is still marked with deprel=root.
         # This may not hold if the original root was a paired punctuation, which was rehanged.
@@ -86,52 +132,81 @@ class FixPunct(Block):
                     if another_node.parent != root and another_node.udeprel == 'root':
                         another_node.udeprel = 'punct'
 
+        if self.copy_to_enhanced:
+            for node in root.descendants:
+                if node.upos == "PUNCT":
+                    node.deps = [{'parent': node.parent, 'deprel': 'punct'}]
+
     def _fix_subord_punct(self, node):
         # Dot used as the ordinal-number marker (in some languages) or abbreviation marker.
         # TODO: detect these cases somehow
         # Numbers can be detected with `node.parent.form.isdigit()`,
         # but abbreviations are more tricky because the Abbr=Yes feature is not always used.
-        if node.form == '.' and node.parent == node.prev_node:
-            return
+        #if node.form == '.' and node.parent == node.prev_node:
+        #    return
 
         # Even non-paired punctuation like commas and dashes may work as paired.
         # Detect such cases and try to preserve, but only if projective.
         p_desc = node.parent.descendants(add_self=1)
-        if node in (p_desc[0], p_desc[-1]) and len(p_desc) == p_desc[-1].ord - p_desc[0].ord + 1:
-            if (p_desc[0].upos == 'PUNCT' and p_desc[-1].upos == 'PUNCT'
-                    and p_desc[0].parent == node.parent and p_desc[-1].parent == node.parent):
-                return
+
+        #if node in (p_desc[0], p_desc[-1]) and len(p_desc) == p_desc[-1].ord - p_desc[0].ord + 1:
+        #    if (p_desc[0].upos == 'PUNCT' and p_desc[-1].upos == 'PUNCT'
+        #            and p_desc[0].parent == node.parent and p_desc[-1].parent == node.parent):
+        #        return
 
         # Initialize the candidates (left and right) with the nearest nodes excluding punctuation.
         # Final punctuation should not be attached to any following, so exclude r_cand there.
         l_cand, r_cand = node.prev_node, node.next_node
         if node.form in FINAL_PUNCT:
             r_cand = None
+
         while l_cand.ord > 0 and l_cand.upos == "PUNCT":
             if self._punct_type[l_cand.ord] == 'opening':
                 l_cand = None
                 break
             l_cand = l_cand.prev_node
+
         while r_cand is not None and r_cand.upos == "PUNCT":
             if self._punct_type[r_cand.ord] == 'closing':
                 r_cand = None
                 break
             r_cand = r_cand.next_node
 
+        l_path, r_path = [l_cand], [r_cand]
+
         # Climb up from the candidates, until we would reach the root or "cross" the punctuation.
         # If the candidates' descendants span across the punctuation, we also stop
         # because climbing higher would cause a non-projectivity (the punct would be the gap).
-        l_path, r_path = [l_cand], [r_cand]
         if l_cand is None or l_cand.is_root():
             l_cand = None
         else:
             while (not l_cand.parent.is_root() and l_cand.parent.precedes(node)
                    and not node.precedes(l_cand.descendants(add_self=1)[-1])):
+
+                # now we are _really_ checking that we don't cross any punctuation
+                #l_boundary = min(l_cand.ord, l_cand.parent.ord)
+                #r_boundary = max(l_cand.ord, l_cand.parent.ord)
+                #if any(token.upos == 'PUNCT' for token in node.root.descendants[l_boundary:r_boundary]):
+                #    break
+                
+                # stop if we are climbing left from a comma
+                # and see a participle (rule for Russian participle clauses)
+                if node.form == ',' and l_cand.feats['VerbForm'] in {'Part', 'Conv'}:
+                    break
+
                 l_cand = l_cand.parent
                 l_path.append(l_cand)
+
         if r_cand is not None:
             while (not r_cand.parent.is_root() and node.precedes(r_cand.parent)
                    and not r_cand.descendants(add_self=1)[0].precedes(node)):
+
+                # now we are _really_ checking that we don't cross any punctuation
+                #l_boundary = min(r_cand.ord, r_cand.parent.ord)
+                #r_boundary = max(r_cand.ord, r_cand.parent.ord)
+                #if any(token.upos == 'PUNCT' for token in node.root.descendants[l_boundary:r_boundary]):
+                #    break
+
                 r_cand = r_cand.parent
                 r_path.append(r_cand)
 
@@ -139,10 +214,18 @@ class FixPunct(Block):
         # The lower one. Note that if neither is descendant of the other and neither is None
         # (which can happen in rare non-projective cases), we arbitrarily prefer l_cand,
         # but if the original parent is either on l_path or r_path, we keep it as acceptable.
-        if l_cand is not None and l_cand.is_descendant_of(r_cand):
+        if node.form in FINAL_PUNCT and l_cand is not None:
+            cand, path = l_cand, l_path
+        elif node.form == ',' and r_cand is not None and r_cand.deprel == 'conj':
+            cand, path = r_cand, r_path
+        elif l_cand is not None and l_cand.is_descendant_of(r_cand):
             cand, path = l_cand, l_path
         elif r_cand is not None and r_cand.is_descendant_of(l_cand):
             cand, path = r_cand, r_path
+        elif node.lemma == ',' and r_cand is not None and r_cand.udeprel == 'parataxis':
+            cand, path = r_cand, l_path + r_path
+        elif node.lemma == ',' and l_cand is not None and l_cand.udeprel == 'parataxis':
+            cand, path = l_cand, l_path + r_path
         elif l_cand is not None:
             cand, path = l_cand, l_path + r_path
         elif r_cand is not None:
@@ -158,11 +241,14 @@ class FixPunct(Block):
         # the second comma should depend on "kennengelernt", not on "Mann"
         # because the unit is just the relative clause.
         # We try to be conservative and keep the parent, unless we are sure it is wrong.
-        if node.parent not in path:
-            node.parent = cand
+        #if node.parent not in path:
+        node.parent = cand
         node.deprel = "punct"
 
     def _fix_paired_punct(self, root, opening_node, closing_punct):
+        if self.check_paired_punct_upos and opening_node.upos != 'PUNCT':
+            return
+
         nested_level = 0
         for node in root.descendants[opening_node.ord:]:
             if node.form == closing_punct:
